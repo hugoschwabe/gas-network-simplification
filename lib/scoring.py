@@ -1,8 +1,8 @@
-import time
 import geopandas as gpd
 import networkx as nx
 import numpy as np
 from scipy.stats import wasserstein_distance
+from scipy.spatial.distance import jensenshannon
 
 import lib.simulation as sim
 import lib.utils as utils
@@ -42,6 +42,67 @@ def complexity(
     # Average the three complexity scores and return result
     return complexity_score
 
+def get_portrait(
+        graph: nx.Graph, 
+        k: int, 
+        weight: str = 'L', 
+        seed: int = 42
+    ) -> np.ndarray:
+    """
+    Computes an approximated network portrait matrix B from a sample of k nodes.
+    """
+    if not graph or graph.number_of_nodes() == 0:
+        return np.zeros((1, 1), dtype=int)
+    
+    # Use a sample of nodes
+    nodes = list(graph.nodes())
+    if len(nodes) > k:
+        # Use a seed for reproducibility
+        rng = np.random.default_rng(seed)
+        sampled_nodes = rng.choice(nodes, size=k, replace=False)
+    else:
+        sampled_nodes = nodes
+
+    num_nodes = graph.number_of_nodes()
+    max_dist = 0
+    portrait_data = [] # Store raw (l, k) pairs first
+
+    # Calculate paths only from sampled nodes
+    for node in sampled_nodes:
+        try:
+            # single_source is much faster than all_pairs
+            distances_from_node = nx.single_source_dijkstra_path_length(graph, node, weight=weight)
+            
+            dist_counts = {}
+            for dist in distances_from_node.values():
+                if dist > 0 and dist != float('inf'):
+                    rounded_dist = int(np.round(dist))
+                    max_dist = max(max_dist, rounded_dist)
+                    if rounded_dist not in dist_counts:
+                        dist_counts[rounded_dist] = 0
+                    dist_counts[rounded_dist] += 1
+            
+            # For each distance l from this source node, we found k neighbors
+            for l, k_count in dist_counts.items():
+                portrait_data.append((l, k_count))
+
+        except nx.NetworkXError:
+            continue
+
+    if not portrait_data:
+        return np.zeros((1, 1), dtype=int)
+
+    # Initialize the portrait matrix with the now known max distance
+    diameter = max_dist
+    portrait = np.zeros((diameter + 1, num_nodes), dtype=int)
+    
+    # Populate the portrait from the collected data
+    for l, k in portrait_data:
+        if l <= diameter and k < num_nodes:
+            portrait[l, k] += 1
+            
+    return portrait
+    
 def structure(
         original:nx.Graph, 
         simplified:nx.Graph, 
@@ -50,26 +111,54 @@ def structure(
     """
     Calculate and return the structure part of the scoring function
     """
-    # Algebraic Connectivity: The second-smallest eigenvalue
-    ac_simplified = nx.linalg.algebraic_connectivity(simplified, weight='norm_capacity')
-    ac_original = nx.linalg.algebraic_connectivity(original, weight='norm_capacity')
-    denominator = ac_simplified + ac_original
-    if denominator < 1e-9:
-        ac_score = 0.0 if ac_original > 1e-9 else 1.0
-    else:
-        ac_score = 1 - (abs(ac_simplified - ac_original) / denominator)
+    APPROX_ORIGINAL = int(0.2 * len(original.nodes()) if 0.2 * len(original.nodes()) > 300 else len(original.nodes()))
+    APPROX_SIMPLIFIED = int(0.2 * len(simplified.nodes()) if 0.2 * len(simplified.nodes()) > 300 else len(simplified.nodes()))
 
+    # Portrait Divergence (PDIV)
+    portrait_before = get_portrait(
+        original, 
+        k=APPROX_ORIGINAL,
+        weight='L'
+    )
+    portrait_after = get_portrait(
+        simplified, 
+        k=APPROX_ORIGINAL,
+        weight='L'
+    )
+
+    # Pad the smaller portrait to match the shape of the larger one
+    max_diam = max(portrait_before.shape[0], portrait_after.shape[0])
+    max_nodes = max(portrait_before.shape[1], portrait_after.shape[1])
+
+    padded_before = np.zeros((max_diam, max_nodes))
+    padded_before[:portrait_before.shape[0], :portrait_before.shape[1]] = portrait_before
+
+    padded_after = np.zeros((max_diam, max_nodes))
+    padded_after[:portrait_after.shape[0], :portrait_after.shape[1]] = portrait_after
+
+    # Flatten matrices to 1D arrays for distance calculation
+    p_dist = padded_before.flatten()
+    q_dist = padded_after.flatten()
+    
+    pdiv_score = 0.0
+    # Avoid division by zero
+    if np.sum(p_dist) > 0 and np.sum(q_dist) > 0:
+        # Jensen-Shannon distance is bounded [0, 1] for base=2.
+        js_distance = jensenshannon(p_dist, q_dist, base=2)
+        pdiv_score = 1.0 - js_distance
+    elif np.array_equal(p_dist, q_dist):
+        pdiv_score = 1.0
 
     # Distribution of Betweenness Centrality: Earth Mover's Distance (EMD)
     centrality_before = nx.betweenness_centrality(
         original, 
-        k=int(0.1 * len(original.nodes())), 
+        k=APPROX_ORIGINAL, 
         weight='L', 
         seed=42
     )
     centrality_after_raw = nx.betweenness_centrality(
         simplified, 
-        k=int(0.1 * len(simplified.nodes()) if 0.1 * len(simplified.nodes()) > 300 else len(simplified.nodes())), 
+        k=APPROX_SIMPLIFIED, 
         weight='L', 
         seed=42
     )
@@ -85,11 +174,12 @@ def structure(
     dist_after = np.array(dist_after_mapped)
 
     max_emd = np.max(dist_before) if len(dist_before) > 0 else 0
-    if max_emd > 1e-9:
+    if max_emd > 0:
         emd_score = 1 - (wasserstein_distance(dist_before, dist_after) / max_emd)
     else:
         emd_score = 1.0
 
+    # Spectral Distance of Graph Laplacians
     # Get a fixed ordering of original nodes for consistent matrix construction
     nodelist = list(original.nodes())
     node_to_idx = {node: i for i, node in enumerate(nodelist)}
@@ -148,12 +238,10 @@ def structure(
         spectral_score = 1.0
 
     # Calculating score
-    structure_score = (ac_score + emd_score + spectral_score) / 3
+    structure_score = (pdiv_score + emd_score + spectral_score) / 3
 
     if verbose:
-        print(f"ac_simplified: {ac_simplified}")
-        print(f"ac_original: {ac_original}")
-        print(f"ac_score: {ac_score}")
+        print(f"pdiv_score: {pdiv_score}")
         print(f"emd_score: {emd_score}")
         print(f"spectral_dist_score: {spectral_score}")
         print(f"structure_score: {structure_score}\n")

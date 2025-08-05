@@ -175,7 +175,13 @@ def prepare_graph_for_max_flow(g: nx.DiGraph) -> nx.DiGraph:
             
     return flow_network
 
-def calculate_max_deliverability(G:nx.DiGraph, sources:str, sinks:str, capacity:str='capacity', flow_func:Callable=edmonds_karp):
+def calculate_max_deliverability(
+        G:nx.DiGraph, 
+        sources:str, 
+        sinks:str, 
+        capacity:str='capacity', 
+        flow_func:Callable=edmonds_karp
+    ) -> float:
     """
     Calculates the deliverability of a network from sources to sinks.
     """
@@ -188,14 +194,14 @@ def calculate_deliverability_error(G_original: nx.DiGraph, G_simplified: nx.DiGr
     """
     Calculates the physical error score between an original and a simplified networkx graph.
     """
-    f_orig, _ = calculate_max_deliverability(
+    f_orig = calculate_max_deliverability(
         G_original, 
         sources="super_source", 
         sinks="super_sink", 
         capacity="capacity",
         flow_func=edmonds_karp
     )
-    f_simp, _ = calculate_max_deliverability(
+    f_simp = calculate_max_deliverability(
         G_simplified, 
         sources="super_source", 
         sinks="super_sink", 

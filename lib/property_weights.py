@@ -6,7 +6,6 @@ import geopandas as gpd
 from lib.utils import estimate_gas_flow, graph_to_nodes_df
 from lib.simulation import calculate_max_deliverability
 
-
 def calculate_node_type_importance(graph: nx.DiGraph) -> pd.DataFrame:
     """
     Performs a Network Resilience & Contingency Analysis (N-1 Criterion).

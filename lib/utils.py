@@ -87,7 +87,7 @@ def build_clustered_graph(
     simplified_edges = []
     for (group_u, group_v), edges_data_list in inter_cluster_edges.items():
         total_capacity = sum(d.get('capacity', 0) for d in edges_data_list)
-        if total_capacity < 1e-9: continue
+        if total_capacity < 0: continue
 
         # Use capacity-weighted average for length
         avg_len = sum(d.get('L', 0) * d.get('capacity', 0) for d in edges_data_list) / total_capacity
