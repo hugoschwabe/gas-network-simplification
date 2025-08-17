@@ -1,6 +1,7 @@
 import networkx as nx
 from itertools import product
 import networkx.algorithms as nx_algorithms
+from networkx.algorithms.community.quality import modularity
 import numpy as np
 
 from sklearn.cluster import KMeans
@@ -8,27 +9,30 @@ from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import silhouette_score
 
 import lib.gnn as gnn
-from lib.utils import estimate_gas_flow, add_norm_capacity
+from lib.utils import estimate_gas_flow, add_norm_capacity, build_clustered_graph, reconnect_nodes, filter_nodes, find_largest_subgraph
 
 
-def contract_paths(G_digraph: nx.DiGraph) -> nx.DiGraph:
+def path_contraction(
+        G:nx.DiGraph,
+        keep_nodes:list=None
+    ) -> nx.DiGraph:
     """
     Correctly performs path contraction on a DiGraph with bidirectional edges.
     """
     # Create an undirected version of the graph. This merges the A->B and B->A edges
     G_undirected = nx.Graph()
-    G_undirected.add_nodes_from(G_digraph.nodes(data=True))
+    G_undirected.add_nodes_from(G.nodes(data=True))
 
     processed_edges = set()
-    for u, v, forward_data in G_digraph.edges(data=True):
+    for u, v, forward_data in G.edges(data=True):
         # Use a sorted tuple to uniquely identify the undirected edge
         edge_key = tuple(sorted((u, v)))
         if edge_key in processed_edges:
             continue
 
         # Check if a reverse edge exists to merge properties
-        if G_digraph.has_edge(v, u):
-            reverse_data = G_digraph.edges[v, u]
+        if G.has_edge(v, u):
+            reverse_data = G.edges[v, u]
             # Combine data by averaging length and taking the minimum diameter
             new_L = (forward_data.get('L', 0) + reverse_data.get('L', 0)) / 2
             new_DN = min(forward_data.get('DN', 0), reverse_data.get('DN', 0))
@@ -90,14 +94,19 @@ def contract_paths(G_digraph: nx.DiGraph) -> nx.DiGraph:
             G_undirected.add_edge(n1, n2, **new_edge_data)
 
     # Rebuild the final DiGraph ensuring every edge is bidirectional
-    final_digraph = nx.DiGraph()
-    final_digraph.add_nodes_from(G_undirected.nodes(data=True))
+    G_simplified = nx.DiGraph()
+    G_simplified.add_nodes_from(G_undirected.nodes(data=True))
     for u, v, data in G_undirected.edges(data=True):
-        final_digraph.add_edge(u, v, **data)
-        final_digraph.add_edge(v, u, **data.copy())
+        G_simplified.add_edge(u, v, **data)
+        G_simplified.add_edge(v, u, **data.copy())
 
-    add_norm_capacity(final_digraph)
-    return final_digraph
+    G_simplified = reconnect_nodes(
+        G,
+        G_simplified,
+        filter_nodes(G, keep_nodes)
+    )
+    add_norm_capacity(G_simplified)
+    return G_simplified
 
 def calculate_absorber_score(n, G):
     w_capacity = 0.8
@@ -110,9 +119,10 @@ def calculate_absorber_score(n, G):
 
 
 def importance_removal(
-    G: nx.DiGraph,
-    importance_scores: dict,
-    removal_fraction: float = 0.1
+    G:nx.DiGraph,
+    importance_scores:dict,
+    keep_nodes:list=None,
+    removal_fraction:float=0.1,
 ) -> nx.DiGraph:
     """
     Simplifies a graph using Node Absorption. Low-importance nodes are removed,
@@ -170,33 +180,54 @@ def importance_removal(
     # Perform all graph modifications at the end
     G_simplified.add_edges_from(new_edges_to_add)
     G_simplified.remove_nodes_from(nodes_to_remove)
-
+    G_simplified = reconnect_nodes(
+        G,
+        G_simplified,
+        filter_nodes(G, keep_nodes)
+    )
+    G_simplified = find_largest_subgraph(G_simplified)
+    add_norm_capacity(G_simplified)
     return G_simplified
 
-def gnn_clustering(original_graph: nx.DiGraph, n_clusters: int = None, coord_weight: float = None) -> list[frozenset]:
+def k_core(
+        G:nx.DiGraph, 
+        keep_nodes:list=None,
+        k:int=4,
+    ) -> nx.DiGraph:
+    G_simplified = nx_algorithms.core.k_core(G, k)
+    G_simplified = reconnect_nodes(
+        G,
+        G_simplified,
+        filter_nodes(G, keep_nodes)
+    )
+    add_norm_capacity(G_simplified)
+    return G_simplified
+
+def gnn_clustering(
+        G:nx.DiGraph, 
+        keep_nodes:list=None,
+        n_clusters:int=None, 
+        coord_weight:float=None
+    ) -> list[frozenset]:
     """
     Main pipeline function to run the entire GNN-based graph simplification process.
     If n_clusters or coord_weight is None, they will be determined automatically.
     """
     # Prepare data with a neutral weight initially for the GNN training
-    pyg_data, node_names_map, scaled_coords = gnn.prepare_data(original_graph, coord_weight=1.0)
+    pyg_data, node_names_map, scaled_coords = gnn.prepare_data(G, coord_weight=1.0)
     trained_model = gnn.train_gnn_model(pyg_data)
 
     # If hyperparameters are not provided, find the optimal values
     if n_clusters is None or coord_weight is None:
         n_clusters, coord_weight = gnn.find_optimal_hyperparameters(trained_model, pyg_data, scaled_coords)
 
-    # Generate the final communities using the determined hyperparameters
+    # Generate the final communities and graph using the determined hyperparameters
     communities = gnn.get_gnn_communities(trained_model, pyg_data, node_names_map, n_clusters, scaled_coords, coord_weight)
+    graph = build_clustered_graph(G, communities)
     
-    return communities
+    return communities, graph
 
-def k_core(G:nx.DiGraph, k:int=4):
-    simplified = nx_algorithms.core.k_core(G, k)
-    add_norm_capacity(simplified)
-    return simplified
-
-def find_optimal_geo_clusters(scaled_coords: np.ndarray, k_range: range = range(20, 251, 10)) -> int:
+def find_optimal_geo_clusters(scaled_coords:np.ndarray, k_range: range = range(20, 251, 10)) -> int:
     best_score = -1
     best_k = -1
 
@@ -223,15 +254,19 @@ def find_optimal_geo_clusters(scaled_coords: np.ndarray, k_range: range = range(
     print(f"\n---> Optimal k found: {best_k} with score {best_score:.4f} <---")
     return best_k
 
-def k_means(original_graph: nx.DiGraph, n_clusters: int = None) -> list[frozenset]:
+def k_means(
+        G:nx.DiGraph, 
+        keep_nodes:list=None, 
+        n_clusters:int=None
+    ) -> list[frozenset]:
     # Extract node coordinates
-    if not original_graph.nodes:
+    if not G.nodes:
         print("Graph has no nodes. Returning empty list.")
         return []
 
     try:
-        node_list = list(original_graph.nodes())
-        coords = np.array([original_graph.nodes[node]['coord'] for node in node_list])
+        node_list = list(G.nodes())
+        coords = np.array([G.nodes[node]['coord'] for node in node_list])
     except KeyError:
         print("Error: Nodes in the graph are missing the 'coord' attribute.")
         return []
@@ -248,19 +283,21 @@ def k_means(original_graph: nx.DiGraph, n_clusters: int = None) -> list[frozense
     cluster_labels = kmeans.fit_predict(coords_scaled)
     print("Clustering complete.")
 
-    # Format results
+    # Format communities
     communities = [[] for _ in range(n_clusters)]
     for i, label in enumerate(cluster_labels):
         node_name = node_list[i]
         communities[label].append(node_name)
 
-    final_communities = [frozenset(community) for community in communities if community]
+    communities = [frozenset(community) for community in communities if community]
     
-    print(f"--- Geographic Clustering Finished. Found {len(final_communities)} communities. ---\n")
-    return final_communities
+    print(f"Geographic Clustering Finished. Found {len(communities)} communities\n")
+
+    G_simplified = build_clustered_graph(G, communities)
+    return communities, G_simplified
 
 # Capacity?, norm_capacity
-def maximum_spanning_arborescence(G:nx.DiGraph, attr:str='capacity') -> nx.DiGraph:
+def maximum_spanning_arborescence(G:nx.DiGraph, keep_nodes:list=None, attr:str='capacity') -> nx.DiGraph:
     arborescence = nx.maximum_spanning_arborescence(G, attr=attr)
 
     # Explicitly copy node data from the original graph to the new one
@@ -269,8 +306,16 @@ def maximum_spanning_arborescence(G:nx.DiGraph, attr:str='capacity') -> nx.DiGra
     
     return arborescence
 
-def greedy_modularity_communities(G:nx.DiGraph) -> list[frozenset]:
-    return nx.algorithms.community.greedy_modularity_communities(G, weight='capacity')
+def greedy_modularity_communities(G:nx.DiGraph, keep_nodes:list=None) -> list[frozenset]:
+    communities = nx.algorithms.community.greedy_modularity_communities(G, weight='capacity')
+    G_simplified = build_clustered_graph(G, communities)
+    print("Gefundene Communities: " + str(len(communities)))
+    print(f"Modularität Q = {modularity(G, communities)}")
+    return communities, G_simplified
 
-def louvain_communities(G:nx.DiGraph, seed:int=42) -> list[frozenset]:
-    return nx.algorithms.community.louvain_communities(G, weight='capacity', seed=seed)
+def louvain_communities(G:nx.DiGraph, keep_nodes:list=None, seed:int=42) -> list[frozenset]:
+    communities = nx.algorithms.community.louvain_communities(G, weight='capacity', seed=seed)
+    G_simplified = build_clustered_graph(G, communities)
+    print("Gefundene Communities: " + str(len(communities)))
+    print(f"Modularität Q = {modularity(G, communities)}")
+    return communities, G_simplified

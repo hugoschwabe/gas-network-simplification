@@ -388,8 +388,8 @@ def score(
         print(f"Warning: Weights do not sum to 1.0 (Sum = {total_weight})")
         return
     
-    simplified_undirected = utils.convert_digraph_to_graph(simplified)
-    original_undirected = utils.convert_digraph_to_graph(original)
+    simplified_undirected = utils.convert_to_graph(simplified)
+    original_undirected = utils.convert_to_graph(original)
     
     score_complexity = complexity(original_undirected, simplified_undirected, verbose)
     score_structure = structure(original_undirected, simplified_undirected, verbose)

@@ -4,3 +4,7 @@
 run.sh
 __pycache__
 log.txt
+.html
+bindings
+tom-select
+vis*

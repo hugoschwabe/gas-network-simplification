@@ -1,115 +1,84 @@
 import pandapipes as pp
 import networkx as nx
+import numpy as np
+import pandas as pd
 from networkx.algorithms.flow import edmonds_karp
 from typing import Callable
 
+from lib.utils import convert_to_graph
+
 def simulate_network(G: nx.DiGraph) -> pp.pandapipesNet:
     """
-    Builds and runs a pandapipes simulation on a DiGraph.
+    Builds and runs a pandapipes simulation from a DiGraph with active components (compressor stations, control valves).
     """
-    if not nx.is_weakly_connected(G):
-        print("Network has disconnected parts. Skipping simulation.")
-        return None
+    G = convert_to_graph(G)
+    G = prepare_cs_for_simulation(G)
 
     print("Building pandapipes network...")
     net = pp.create_empty_network(fluid="methane")
     nx_to_pp_junctions = {}
 
-    # Create junctions only for non-CS/CV nodes
     print("Creating network junctions...")
     for node, data in G.nodes(data=True):
-        if str(node).startswith(("CS", "CV")):
-            continue
-        junction_idx = pp.create_junction(net, pn_bar=1.0, tfluid_k=293.15, name=str(node))
+        junction_idx = pp.create_junction(net, pn_bar=1.0, tfluid_k=283.15, name=str(node))
         nx_to_pp_junctions[node] = junction_idx
 
-    # Identify and select the pressure reference node (IC)
-    reference_candidates = {n for n in G.nodes if str(n).startswith("IC")}
-    if not reference_candidates:
-        print("ERROR: No Interconnector (IC) nodes found. Cannot set a pressure reference.")
-        return None
-    reference_node = list(reference_candidates)[0]
-    print(f"Selected Interconnector '{reference_node}' as the main pressure reference.")
-
-    # Create the single external grid
-    pp.create_ext_grid(net, junction=nx_to_pp_junctions[reference_node], p_bar=60.0, t_k=293.15)
-
-    # Create all other network components
-    processed_edges = set()
-
-    # Handle node-based components
-    print("Creating node-based components (sources, sinks, compressors, valves)...")
+    # Handle Sources, Sinks, and the External Grid (Pressure Reference)
+    print("Creating sources, sinks, and pressure reference...")
+    reference_node_found = False
     for node, data in G.nodes(data=True):
-        node_name = str(node)
-        if node == reference_node:
+        # The first Interconnector found is the pressure reference
+        if str(node).startswith("IC") and not reference_node_found:
+            pp.create_ext_grid(net, junction=nx_to_pp_junctions[node], p_bar=60.0, t_k=283.15)
+            print(f"Selected Interconnector '{node}' as the main pressure reference.")
+            reference_node_found = True
+            # Skip creating a source/sink for the reference node
             continue
 
-        if node_name.startswith("CS") or node_name.startswith("CV"):
-            # A component should have exactly one inlet and one outlet
-            if G.in_degree(node) != 1 or G.out_degree(node) != 1:
-                print(f"WARNING: Component '{node_name}' requires 1 inlet/1 outlet, but has "
-                      f"{G.in_degree(node)}/{G.out_degree(node)}. Skipping.")
-                continue
+        # Create sources and sinks based on the supply attribute
+        supply_value = data.get('supply', 0)
+        if supply_value > 0:
+            pp.create_source(net, junction=nx_to_pp_junctions[node], mdot_kg_per_s=supply_value)
+        elif supply_value < 0:
+            pp.create_sink(net, junction=nx_to_pp_junctions[node], mdot_kg_per_s=abs(supply_value))
+    
+    if not reference_node_found:
+        print("ERROR: No Interconnector (IC) node found. Cannot set a pressure reference.")
+        return None
 
-            # Get the defined inlet and outlet from the directed graph
-            inlet = list(G.predecessors(node))[0]
-            outlet = list(G.successors(node))[0]
-
-            if str(inlet).startswith(("CS", "CV")) or str(outlet).startswith(("CS", "CV")):
-                print(f"WARNING: Component '{node_name}' is adjacent to another active component. Skipping.")
-                continue
-
-            # Get junctions for the inlet and outlet nodes
-            junc_in = nx_to_pp_junctions[inlet]
-            junc_out = nx_to_pp_junctions[outlet]
-            
-            # Use the defined direction to orient the component
-            if node_name.startswith("CS"):
-                ratio = data.get('pressure_ratio', 1.2)
-                pp.create_compressor(net, from_junction=junc_in, to_junction=junc_out,
-                                    pressure_ratio=ratio, name=node_name)
-            elif node_name.startswith("CV"):
-                diam_m = data.get('DN', 100) / 100
-                pp.create_valve(net, from_junction=junc_in, to_junction=junc_out,
-                                diameter_m=diam_m, opened=True, name=node_name)
-
-            # Mark the two directed edges as processed
-            processed_edges.add((inlet, node))
-            processed_edges.add((node, outlet))
-
-        # Handle sources and sinks
-        else:
-            supply_value = data.get('supply', 0)
-            if supply_value > 0:
-                pp.create_source(net, junction=nx_to_pp_junctions[node], mdot_kg_per_s=supply_value)
-            elif supply_value < 0:
-                pp.create_sink(net, junction=nx_to_pp_junctions[node], mdot_kg_per_s=abs(supply_value))
-
-    # Create pipes for all remaining edges
-    print("Creating passive components (pipes)...")
+    print("Creating network components (pipes, compressors, valves)...")
+    vector = calculate_flow_vector(G)
     for u, v, data in G.edges(data=True):
-        # Skip any edge connected to a CS or CV node. This acts as a safeguard for components that had invalid configurations
-        if str(u).startswith(("CS", "CV")) or str(v).startswith(("CS", "CV")):
-            continue
-        
-        if (u, v) in processed_edges:
-            continue
-            
-        pp.create_pipe_from_parameters(net, from_junction=nx_to_pp_junctions[u],
-                                       to_junction=nx_to_pp_junctions[v],
-                                       length_km=data.get('L', 0) / 1000,
-                                       diameter_m=data.get('DN', 0) / 100,
-                                       name=f"Pipe {u}-{v}")
+        edge_type = data.get("edge_type", "pipe")
 
-    # Final checks and simulation run
-    zero_diameter_pipes = net.pipe[net.pipe.diameter_m == 0]
+        from_node, to_node = get_compressor_direction(G, (u, v), vector)
+        junc_from = nx_to_pp_junctions[from_node]
+        junc_to = nx_to_pp_junctions[to_node]
+
+        if edge_type == "compressor station":
+            ratio = data.get('pressure_ratio', 1.2)
+            pp.create_compressor(net, from_junction=junc_from, to_junction=junc_to,
+                                pressure_ratio=ratio, name=f"CS_{u}-{v}")
+        elif edge_type == "control valve":
+            diam_m = data.get('DN', 100) / 1000
+            pp.create_valve(net, from_junction=junc_from, to_junction=junc_to,
+                            diameter_m=diam_m, opened=True, name=f"CV_{u}-{v}")
+        else: # This is a standard pipe
+            pp.create_pipe_from_parameters(net, from_junction=junc_from,
+                                           to_junction=junc_to,
+                                           length_km=data.get('L', 0.0),
+                                           diameter_m=data.get('DN', 0.0) / 1000,
+                                           name=f"Pipe_{u}-{v}")
+
+    # --- Final checks and simulation run ---
+    zero_diameter_pipes = net.pipe[net.pipe.diameter_m <= 0]
     if not zero_diameter_pipes.empty:
-        print("WARNING: Found pipes with zero diameter, which act as blockages. Skipping.")
+        print(f"WARNING: Found {len(zero_diameter_pipes)} pipes with zero or negative diameter. Skipping.")
         return None
 
     print("\nRunning simulation...")
     try:
-        pp.pipeflow(net, stop_condition="tol", iter=30, tol_p=1e-4, tol_v=1e-4)
+        pp.pipeflow(net, stop_condition="tol", iter=30, tol_p=0.0, tol_v=0.0)
         print("Simulation successful!")
         return net
     except Exception as e:
@@ -132,15 +101,14 @@ def simulate_clustered_network(simplified_graph: nx.DiGraph) -> pp.pandapipesNet
 
     # Get the mapping from virtual nodes to original nodes and their data
     virtual_node_map = nx.get_node_attributes(simplified_graph, 'original_nodes')
-    original_node_data = nx.get_node_attributes(simplified_graph, 'original_node_data') # Assuming you store this
+    original_node_data = nx.get_node_attributes(simplified_graph, 'original_node_data')
 
-    # --- AGGREGATION LOGIC ---
+    # Aggregation logic
     for simp_node, junction_idx in nx_to_pp_junctions.items():
         original_nodes_in_cluster = virtual_node_map.get(simp_node, [simp_node])
         
         net_supply_kg_per_s = 0
         for orig_node in original_nodes_in_cluster:
-            # You must have access to the original node's data here
             data = original_node_data.get(orig_node, {})
             net_supply_kg_per_s += data.get('supply', 0)
 
@@ -209,8 +177,8 @@ def calculate_deliverability_error(G_original: nx.DiGraph, G_simplified: nx.DiGr
         flow_func=edmonds_karp
     )
 
-    print(f"Original Deliverability: {f_orig:.2f} kg/s")
-    print(f"Simplified Deliverability: {f_simp:.2f} kg/s")
+    print(f"Original Deliverability: {f_orig} kg/s")
+    print(f"Simplified Deliverability: {f_simp} kg/s")
 
     if f_orig == 0:
         return 0.0 if f_simp == 0 else float('inf')
@@ -219,3 +187,156 @@ def calculate_deliverability_error(G_original: nx.DiGraph, G_simplified: nx.DiGr
     if error > 1: return 1
 
     return error
+
+def calculate_flow_vector(G: nx.Graph) -> np.ndarray:
+    """
+    Calculates the dominant flow vector for a network based on the geographic centers of supply and demand.
+    """
+    node_data = [
+        {'node': node, 'x': data['coord'][0], 'y': data['coord'][1], 'supply': data['supply']}
+        for node, data in G.nodes(data=True)
+        if 'coord' in data and 'supply' in data
+    ]
+    
+    if not node_data:
+        print("WARNING: Graph has no nodes with 'x', 'y', and 'supply' attributes.")
+        return None
+
+    df = pd.DataFrame(node_data)
+    
+    supply_points = df[df['supply'] > 0]
+    demand_points = df[df['supply'] < 0]
+
+    if supply_points.empty or demand_points.empty:
+        print("WARNING: Cannot determine flow vector (no supplies or demands).")
+        return None
+        
+    demand_points = demand_points.copy()
+    demand_points['supply'] = demand_points['supply'].abs()
+
+    supply_center_x = (supply_points['x'] * supply_points['supply']).sum() / supply_points['supply'].sum()
+    supply_center_y = (supply_points['y'] * supply_points['supply']).sum() / supply_points['supply'].sum()
+
+    demand_center_x = (demand_points['x'] * demand_points['supply']).sum() / demand_points['supply'].sum()
+    demand_center_y = (demand_points['y'] * demand_points['supply']).sum() / demand_points['supply'].sum()
+
+    return np.array([demand_center_x - supply_center_x, demand_center_y - supply_center_y])
+
+def get_compressor_direction(
+    G: nx.Graph, 
+    compressor_edge: tuple[str, str], 
+    flow_vector: np.ndarray
+) -> tuple[str, str]:
+    """
+    Orients a single compressor edge to align with a pre-calculated dominant flow vector.
+    """
+    # Get the two connection points directly from the edge tuple
+    pt1, pt2 = compressor_edge
+    
+    # Check if both nodes have the required 'coord' attribute
+    if not all('coord' in G.nodes[p] for p in [pt1, pt2]):
+        print(f"WARNING: Nodes for edge {compressor_edge} are missing the 'coord' attribute. Returning default direction.")
+        return pt1, pt2 # Return default if coordinates are missing
+
+    # Correctly extract coordinates into 1D numpy arrays
+    coords1 = np.array(G.nodes[pt1]['coord'])
+    coords2 = np.array(G.nodes[pt2]['coord'])
+    
+    # Calculate the compressor's own vector and the dot product for alignment
+    compressor_vector = coords2 - coords1
+    dot_product = np.dot(flow_vector, compressor_vector)
+    
+    # If dot product > 0, the vectors are aligned (pt1 -> pt2).
+    # Otherwise, they are opposed (pt2 -> pt1).
+    return (pt1, pt2) if dot_product > 0 else (pt2, pt1)
+
+def prepare_cs_for_simulation(G: nx.Graph) -> nx.Graph:
+    """
+    Prepares an undirected graph by replacing compressor edges with a detailed
+    inlet/outlet node structure.
+    """
+    G_mod = G.copy()
+    
+    # Find all compressor edges first, as the graph will be modified
+    compressor_edges = [
+        (u, v, data) for u, v, data in G.edges(data=True)
+        if data.get("edge_type") == "compressor station"
+    ]
+
+    print(f"Found {len(compressor_edges)} compressor edges to remodel.")
+
+    for u, v, cs_data in compressor_edges:
+        # Define names for the new inlet and outlet nodes
+        u_sorted, v_sorted = sorted((u, v))
+        inlet_node_name = f"{u_sorted}-{v_sorted}_virtual_1"
+        outlet_node_name = f"{u_sorted}-{v_sorted}vitrual_2"
+        
+        # New nodes can inherit data (like coordinates)
+        inlet_node_data = G_mod.nodes.get(u, {})
+        outlet_node_data = G_mod.nodes.get(v, {})
+
+        # Define properties for the new short connector pipes
+        connector_pipe_data = {
+            "edge_type": "pipe",
+            "L": 0.00001,  # Minimal length in km
+            "DN": cs_data.get("DN"),
+            "Pmax": cs_data.get("Pmax")
+        }
+
+        # Remove the original compressor edge
+        if G_mod.has_edge(u, v):
+            G_mod.remove_edge(u, v)
+        
+        # Add the new nodes
+        G_mod.add_node(inlet_node_name, **inlet_node_data)
+        G_mod.add_node(outlet_node_name, **outlet_node_data)
+        
+        # Add the new 3-edge undirected chain
+        G_mod.add_edge(u, inlet_node_name, **connector_pipe_data)
+        G_mod.add_edge(inlet_node_name, outlet_node_name, **cs_data)
+        G_mod.add_edge(outlet_node_name, v, **connector_pipe_data)
+
+    return G_mod
+
+def calculate_total_flow(net: pp.pandapipesNet) -> float:
+    """
+    Calculates the total mass flow within a network from pandapipes simulation results by summing the absolute mass flow rates in all pipes.
+    """
+    # Check if the simulation results exist
+    if 'res_pipe' not in net or net.res_pipe.empty:
+        print("WARNING: Simulation results (net.res_pipe) not found. Returning 0.0")
+        return 0.0
+
+    # The 'mdot_from_kg_per_s' column contains the mass flow for each pipe.
+    total_flow = net.res_pipe['mdot_from_kg_per_s'].abs().sum()
+    
+    return total_flow
+
+def check_supply_balance(G: nx.Graph) -> dict[str, float]:
+    """
+    Calculates the total supply (sources) and total demand (sinks) from the 'supply' attribute of the nodes in a graph.
+    """
+    total_supply = 0.0
+    total_demand = 0.0
+
+    # Iterate through all nodes and sum up supply/demand
+    for node, data in G.nodes(data=True):
+        supply_value = data.get('supply', 0.0)
+        if supply_value > 0:
+            total_supply += supply_value
+        elif supply_value < 0:
+            total_demand += abs(supply_value)
+
+    balance = total_supply - total_demand
+
+    # Print the results for easy diagnosis
+    print("--- Supply/Demand Balance Check ---")
+    print(f"Total Supply (Sources): {total_supply:,.2f} kg/s")
+    print(f"Total Demand (Sinks):   {total_demand:,.2f} kg/s")
+    print(f"Balance (Supply - Demand): {balance:,.2f} kg/s\n")
+    
+    return {
+        "total_supply": total_supply,
+        "total_demand": total_demand,
+        "balance": balance
+    }
