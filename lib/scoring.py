@@ -365,8 +365,8 @@ def flow(original: nx.Graph, simplified: nx.Graph, verbose: bool = False) -> flo
     return flow_score
 
 def score(
-    original: nx.DiGraph,
-    simplified: nx.DiGraph,
+    original: nx.Graph,
+    simplified: nx.Graph,
     regions: gpd.GeoDataFrame,
     weights: dict = {},
     property_weights: dict = {},
@@ -388,13 +388,10 @@ def score(
         print(f"Warning: Weights do not sum to 1.0 (Sum = {total_weight})")
         return
     
-    simplified_undirected = utils.convert_to_graph(simplified)
-    original_undirected = utils.convert_to_graph(original)
-    
-    score_complexity = complexity(original_undirected, simplified_undirected, verbose)
-    score_structure = structure(original_undirected, simplified_undirected, verbose)
-    score_regionality = regionality(original_undirected, simplified_undirected, regions, verbose)
-    score_properties = properties(original_undirected, simplified_undirected, property_weights, verbose)
+    score_complexity = complexity(original, simplified, verbose)
+    score_structure = structure(original, simplified, verbose)
+    score_regionality = regionality(original, simplified, regions, verbose)
+    score_properties = properties(original, simplified, property_weights, verbose)
     score_flow = flow(original, simplified, verbose)
     
 

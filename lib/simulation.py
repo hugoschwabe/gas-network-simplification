@@ -5,14 +5,10 @@ import pandas as pd
 from networkx.algorithms.flow import edmonds_karp
 from typing import Callable
 
-from lib.utils import convert_to_graph
-
-def simulate_network(G: nx.DiGraph) -> pp.pandapipesNet:
+def simulate_network(G: nx.Graph) -> pp.pandapipesNet:
     """
-    Builds and runs a pandapipes simulation from a DiGraph with active components (compressor stations, control valves).
+    Builds and runs a pandapipes simulation from a Graph with active components (compressor stations, control valves).
     """
-    G = convert_to_graph(G)
-    G = prepare_cs_for_simulation(G)
 
     print("Building pandapipes network...")
     net = pp.create_empty_network(fluid="methane")
@@ -70,7 +66,7 @@ def simulate_network(G: nx.DiGraph) -> pp.pandapipesNet:
                                            diameter_m=data.get('DN', 0.0) / 1000,
                                            name=f"Pipe_{u}-{v}")
 
-    # --- Final checks and simulation run ---
+    # Final checks and simulation run
     zero_diameter_pipes = net.pipe[net.pipe.diameter_m <= 0]
     if not zero_diameter_pipes.empty:
         print(f"WARNING: Found {len(zero_diameter_pipes)} pipes with zero or negative diameter. Skipping.")
@@ -86,7 +82,7 @@ def simulate_network(G: nx.DiGraph) -> pp.pandapipesNet:
         return None
     
 
-def simulate_clustered_network(simplified_graph: nx.DiGraph) -> pp.pandapipesNet:
+def simulate_clustered_network(simplified_graph: nx.Graph) -> pp.pandapipesNet:
     """
     Builds and runs a pandapipes simulation for a potentially clustered graph.
     """
@@ -125,7 +121,7 @@ def simulate_clustered_network(simplified_graph: nx.DiGraph) -> pp.pandapipesNet
 
     return net
 
-def prepare_graph_for_max_flow(g: nx.DiGraph) -> nx.DiGraph:
+def prepare_graph_for_max_flow(g: nx.Graph) -> nx.Graph:
     """
     Takes any network graph with 'supply' attributes on its nodes and adds
     super_source/super_sink nodes for max_flow analysis.
@@ -144,7 +140,7 @@ def prepare_graph_for_max_flow(g: nx.DiGraph) -> nx.DiGraph:
     return flow_network
 
 def calculate_max_deliverability(
-        G:nx.DiGraph, 
+        G:nx.Graph, 
         sources:str, 
         sinks:str, 
         capacity:str='capacity', 
@@ -158,7 +154,7 @@ def calculate_max_deliverability(
     flow_value, _ = nx.maximum_flow(G_flow, sources, sinks, capacity=capacity, flow_func=flow_func)
     return flow_value
 
-def calculate_deliverability_error(G_original: nx.DiGraph, G_simplified: nx.DiGraph) -> float:
+def calculate_deliverability_error(G_original: nx.Graph, G_simplified: nx.Graph) -> float:
     """
     Calculates the physical error score between an original and a simplified networkx graph.
     """
@@ -233,9 +229,9 @@ def get_compressor_direction(
     # Get the two connection points directly from the edge tuple
     pt1, pt2 = compressor_edge
     
-    # Check if both nodes have the required 'coord' attribute
+    # Check if both nodes have the required coord attribute
     if not all('coord' in G.nodes[p] for p in [pt1, pt2]):
-        print(f"WARNING: Nodes for edge {compressor_edge} are missing the 'coord' attribute. Returning default direction.")
+        print(f"WARNING: Nodes for edge {compressor_edge} are missing the coord attribute. Returning default direction.")
         return pt1, pt2 # Return default if coordinates are missing
 
     # Correctly extract coordinates into 1D numpy arrays
@@ -246,14 +242,11 @@ def get_compressor_direction(
     compressor_vector = coords2 - coords1
     dot_product = np.dot(flow_vector, compressor_vector)
     
-    # If dot product > 0, the vectors are aligned (pt1 -> pt2).
-    # Otherwise, they are opposed (pt2 -> pt1).
     return (pt1, pt2) if dot_product > 0 else (pt2, pt1)
 
 def prepare_cs_for_simulation(G: nx.Graph) -> nx.Graph:
     """
-    Prepares an undirected graph by replacing compressor edges with a detailed
-    inlet/outlet node structure.
+    Prepares an undirected graph by replacing compressor edges with a detailed inlet/outlet node structure.
     """
     G_mod = G.copy()
     
@@ -314,7 +307,7 @@ def calculate_total_flow(net: pp.pandapipesNet) -> float:
 
 def check_supply_balance(G: nx.Graph) -> dict[str, float]:
     """
-    Calculates the total supply (sources) and total demand (sinks) from the 'supply' attribute of the nodes in a graph.
+    Calculates the total supply (sources) and total demand (sinks) from the supply attribute of the nodes in a graph.
     """
     total_supply = 0.0
     total_demand = 0.0
@@ -329,7 +322,6 @@ def check_supply_balance(G: nx.Graph) -> dict[str, float]:
 
     balance = total_supply - total_demand
 
-    # Print the results for easy diagnosis
     print("--- Supply/Demand Balance Check ---")
     print(f"Total Supply (Sources): {total_supply:,.2f} kg/s")
     print(f"Total Demand (Sinks):   {total_demand:,.2f} kg/s")

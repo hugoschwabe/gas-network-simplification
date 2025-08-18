@@ -9,21 +9,52 @@ from pyvis.network import Network
 import numpy as np
 import json
 
-def write_gml(G:nx.DiGraph, path:str) -> None:
-    G = copy.deepcopy(G)
+def _sanitize_value_for_gml(value):
+    """
+    Sanitizes an attribute value for GML compatibility.
+    """
+    # If the value is not a dictionary it does not need to be changed.
+    if not isinstance(value, dict):
+        return value
 
-    for node, data in G.nodes(data=True):
-        data.pop("supply", None)  # Remove if exists
-        
-    for u, v, data in G.edges(data=True):
+    # Check if the values within this dictionary are also dictionaries.
+    if value and isinstance(next(iter(value.values())), dict):
+        restructured_list = []
+        for node_key, data_dict in value.items():
+            # Create a new dictionary for this entry
+            new_entry = {'node_name': str(node_key)}
+            # Merge the original data into it
+            new_entry.update(data_dict)
+            restructured_list.append(new_entry)
+        return restructured_list
+
+    return value
+
+
+def write_gml(G: nx.Graph, path: str) -> None:
+    """
+    Writes a graph to GML, sanitizing incompatible attribute structures first.
+    """
+    G_copy = copy.deepcopy(G)
+
+    # Sanitize node attributes
+    for node, data in G_copy.nodes(data=True):
+        data.pop("supply", None)
+        for attr_key, attr_value in data.items():
+            data[attr_key] = _sanitize_value_for_gml(attr_value)
+
+    # Sanitize edge attributes
+    for u, v, data in G_copy.edges(data=True):
         data.pop("capacity", None)
         data.pop("norm_capacity", None)
+        for attr_key, attr_value in data.items():
+            data[attr_key] = _sanitize_value_for_gml(attr_value)
 
-    G = G.to_undirected()
+    # Write to GML
+    nx.write_gml(G_copy, path)
+    print(f"Graph successfully saved to {path} after restructuring attributes.")
 
-    nx.write_gml(G, path)
-
-def graph_node_names(G:nx.DiGraph) -> list[str]:
+def graph_node_names(G:nx.Graph) -> list[str]:
     """
     Returns a flat list of node names from a graph.
     """
@@ -46,7 +77,7 @@ def graph_node_names(G:nx.DiGraph) -> list[str]:
     except StopIteration:
         return []
 
-def graph_to_nodes_df(G:nx.DiGraph) -> pd.DataFrame:
+def graph_to_nodes_df(G:nx.Graph) -> pd.DataFrame:
     """
     Converts graph's nodes into a dataframe while preserving all attributes.
     """
@@ -57,14 +88,7 @@ def graph_to_nodes_df(G:nx.DiGraph) -> pd.DataFrame:
 
 def graph_to_edges_df(G:nx.Graph) -> pd.DataFrame:
     """
-    Converts a NetworkX graph's edge data into a pandas DataFrame,
-    sorted by the 'capacity' attribute in descending order.
-
-    Args:
-        G: The input NetworkX graph.
-
-    Returns:
-        A pandas DataFrame containing the edge data, sorted by capacity.
+    Converts a NetworkX graph's edge data into a pandas DataFrame, sorted by the capacity attribute in descending order.
     """
     # Create a list of dictionaries, where each dictionary represents an edge
     edge_list = []
@@ -82,22 +106,12 @@ def graph_to_edges_df(G:nx.Graph) -> pd.DataFrame:
 
     return df#[df["L"] > 1]
 
-def run_algo(G:nx.DiGraph, func) -> list[frozenset]:
-    """
-    Run a NetworkX algorithm and return the results.
-    """
-    results = func(G)
-    print("Gefundene Communities: " + str(len(results)))
-    mod_value = modularity(G, results)
-    print(f"Modularität Q = {mod_value}")
-    return results
-
 def build_clustered_graph(
-    G:nx.DiGraph,
+    G:nx.Graph,
     results: list[frozenset]
-) -> nx.DiGraph:
+) -> nx.Graph:
     """
-    Builds a robust simplified nx.DiGraph from community detection results.
+    Builds a robust simplified nx.Graph from community detection results.
     """
     # Map each original node to its new group (cluster) ID
     node_to_group_map = {node: i for i, community in enumerate(results) for node in community}
@@ -152,7 +166,7 @@ def build_clustered_graph(
         simplified_edges.append((group_u, group_v, new_edge_data))
 
     # Build the final simplified graph
-    simplified_graph = nx.DiGraph()
+    simplified_graph = nx.Graph()
     for group_id, data in simplified_nodes_agg.iterrows():
         simplified_graph.add_node(
             f"C_{group_id}",
@@ -182,7 +196,7 @@ def build_clustered_graph(
 
 
 def plot_network(
-        G:nx.DiGraph, 
+        G:nx.Graph, 
         gdf:gpd.GeoDataFrame=None, 
         clusters:list=None, 
         node_size:int=20, 
@@ -249,15 +263,14 @@ def plot_network(
     plt.show()
 
 def plot_network_pyvis(
-    G: nx.DiGraph, 
+    G: nx.Graph, 
     title: str = "Interactive Gas Network",
     filename: str = "interactive_network.html"
 ) -> None:
-    G_undirected = G.to_undirected()
     try:
-        pos = {node: data["coord"] for node, data in G_undirected.nodes(data=True)}
+        pos = {node: data["coord"] for node, data in G.nodes(data=True)}
     except KeyError:
-        pos = {node: (data.get("x", 0), data.get("y", 0)) for node, data in G_undirected.nodes(data=True)}
+        pos = {node: (data.get("x", 0), data.get("y", 0)) for node, data in G.nodes(data=True)}
     valid_pos = {
         node: (x, y) for node, (x, y) in pos.items() 
         if x is not None and y is not None and np.isfinite(x) and np.isfinite(y)
@@ -306,7 +319,7 @@ def plot_network_pyvis(
     net.set_options(json.dumps(options))
 
     # Add Nodes by assigning them to a group
-    for node, data in G_undirected.nodes(data=True):
+    for node, data in G.nodes(data=True):
         node_name = str(node)
         node_position = scaled_pos.get(node)
         
@@ -339,13 +352,13 @@ def plot_network_pyvis(
             )
 
     # Add Edges
-    for u, v, data in G_undirected.edges(data=True):
+    for u, v, data in G.edges(data=True):
         net.add_edge(u, v, color='gray', title=f"Data: {data}")
         
     net.show(filename)
     print(f"Interactive graph saved to '{filename}'")
 
-def filter_nodes(G:nx.DiGraph, prefixes:list[str]) -> list:
+def filter_nodes(G:nx.Graph, prefixes:list[str]) -> list:
     """
     Filters nodes in a networkx graph based on whether their label attribute starts with "CS".
     """
@@ -353,7 +366,7 @@ def filter_nodes(G:nx.DiGraph, prefixes:list[str]) -> list:
     return [(node, data) for node, data in G.nodes(data=True) if str(node).startswith(prefix_tuple)]
 
 def find_closest_node(
-    G:nx.DiGraph,
+    G:nx.Graph,
     start_node:str,
     target_nodes:set
 ) -> str:
@@ -372,10 +385,10 @@ def find_closest_node(
         return None
 
 def reconnect_nodes(
-    G:nx.DiGraph,
-    simplified:nx.DiGraph,
+    G:nx.Graph,
+    simplified:nx.Graph,
     nodes:list[tuple]
-) -> nx.DiGraph:
+) -> nx.Graph:
     """
     Adds filtered nodes and their edges to a regular (non-clustered) graph.
     """
@@ -445,21 +458,15 @@ def reconnect_nodes(
     print(f"{component_edges_added} critical component edges re-inserted.\n")
     return simplified
 
-def find_disconnected_nodes(graph:nx.DiGraph) -> list:
+def find_largest_subgraph(G:nx.Graph) -> nx.Graph:
     """
-    Finds all nodes in a NetworkX graph that have a degree of 0.
+    Finds the largest connected component in a Graph.
     """
-    return [node for node in graph.nodes() if graph.degree(node) == 0]
-
-def find_largest_subgraph(G:nx.DiGraph) -> nx.DiGraph:
-    """
-    Finds the largest connected component in a DiGraph.
-    """
-    connected_components = list(nx.weakly_connected_components(G))
+    connected_components = list(nx.connected_components(G))
 
     if not connected_components:
         print("Graph appears to be empty.")
-        return nx.DiGraph()
+        return nx.Graph()
 
     # Find the component with the most nodes
     largest_component_nodes = max(connected_components, key=len)
@@ -468,46 +475,6 @@ def find_largest_subgraph(G:nx.DiGraph) -> nx.DiGraph:
     largest_component_subgraph = G.subgraph(largest_component_nodes).copy()
     
     return largest_component_subgraph
-
-def convert_to_graph(G:nx.DiGraph) -> nx.Graph:
-    """
-    Converts a nx.DiGraph to nx.Graph, safely merging attributes from bi-directional edges to prevent data loss.
-    """
-    # Create a new undirected graph from the directed one
-    G_un = G.to_undirected(as_view=False)
-    
-    # Find bidirectional edges in the original DiGraph
-    for u, v in G_un.edges():
-        if G.has_edge(u, v) and G.has_edge(v, u):
-            # Both directions exist, so we merge attributes
-            data_uv = G.edges[u, v]
-            data_vu = G.edges[v, u]
-
-            # For capacity take the maximum of the two
-            merged_capacity = max(data_uv.get('capacity', 0.0), data_vu.get('capacity', 0.0))
-            merged_L = data_uv.get('L', 0) + data_vu.get('L', 0)
-            merged_DN = min(data_uv.get('DN', float('inf')), data_vu.get('DN', float('inf')))
-
-            G_un.edges[u, v]['capacity'] = merged_capacity
-            G_un.edges[u, v]['L'] = merged_L
-            G_un.edges[u, v]['DN'] = merged_DN
-
-    return G_un
-
-def convert_to_digraph(G:nx.Graph) -> nx.DiGraph:
-    """
-    Convert nx.Graph to nx.DiGraph.
-    """
-    G_di = nx.DiGraph()
-    G_di.add_nodes_from(G.nodes(data=True))
-
-    # For every edge in the original data add forward and reverse edge
-    for u, v, data in G.edges(data=True):
-        G_di.add_edge(u, v, **data)
-        # Add the reverse edge
-        G_di.add_edge(v, u, **data.copy())
-
-    return G_di
 
 def estimate_gas_flow(
         p_bar:float, 
@@ -549,7 +516,7 @@ def estimate_gas_flow(
     except (ValueError, ZeroDivisionError):
         return 0.0
 
-def add_capacity(G:nx.DiGraph, k_p:float=0.2) -> None:
+def add_capacity(G:nx.Graph, k_p:float=0.2) -> None:
     """
     Add capacity values in kg/s to edges.
     """
@@ -566,7 +533,7 @@ def add_capacity(G:nx.DiGraph, k_p:float=0.2) -> None:
             capacity = estimate_gas_flow(p_bar=pmax, dn_mm=dn, length_km=length, k_p=k_p)
             data['capacity'] = capacity
 
-def add_norm_capacity(G:nx.DiGraph) -> None:
+def add_norm_capacity(G:nx.Graph) -> None:
     """
     Add normalized capacity values to edges.
     """
@@ -589,7 +556,7 @@ def add_norm_capacity(G:nx.DiGraph) -> None:
                     norm_val = 1.0
                 data['norm_capacity'] = norm_val
 
-def add_dummy_supply(G:nx.DiGraph, throughput:float=5000.0) -> None:
+def add_dummy_supply(G:nx.Graph, throughput:float=5000.0) -> None:
     """
     Add dummy supply/demand data to nodes. Define a realistic total system throughput (e.g., in kg/s).
     """
@@ -653,7 +620,7 @@ def add_dummy_supply(G:nx.DiGraph, throughput:float=5000.0) -> None:
             data['supply'] = 0.0
 
 def add_supply_from_csv(
-        G: nx.DiGraph, 
+        G: nx.Graph, 
         csv_path:str, 
         verbose:bool = False
     ) -> None:

@@ -23,7 +23,7 @@ class GNNEncoder(torch.nn.Module):
         return self.conv2(x, edge_index, edge_attr=edge_attr)
 
 # Data preparation function
-def prepare_data(G: nx.DiGraph, coord_weight: float = 1.0) -> tuple[Data, list, np.ndarray]:
+def prepare_data(G: nx.Graph, coord_weight: float = 1.0) -> tuple[Data, list, np.ndarray]:
     node_df = pd.DataFrame.from_dict(dict(G.nodes(data=True)), orient='index')
     original_node_names = node_df.index.tolist()
 

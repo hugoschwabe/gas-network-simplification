@@ -3,6 +3,7 @@ from itertools import product
 import networkx.algorithms as nx_algorithms
 from networkx.algorithms.community.quality import modularity
 import numpy as np
+import math
 
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import MinMaxScaler
@@ -13,11 +14,11 @@ from lib.utils import estimate_gas_flow, add_norm_capacity, build_clustered_grap
 
 
 def path_contraction(
-        G:nx.DiGraph,
+        G:nx.Graph,
         keep_nodes:list=None
-    ) -> nx.DiGraph:
+    ) -> nx.Graph:
     """
-    Correctly performs path contraction on a DiGraph with bidirectional edges.
+    Correctly performs path contraction on a Graph with bidirectional edges.
     """
     # Create an undirected version of the graph. This merges the A->B and B->A edges
     G_undirected = nx.Graph()
@@ -93,8 +94,8 @@ def path_contraction(
             G_undirected.remove_node(node)
             G_undirected.add_edge(n1, n2, **new_edge_data)
 
-    # Rebuild the final DiGraph ensuring every edge is bidirectional
-    G_simplified = nx.DiGraph()
+    # Rebuild the final Graph ensuring every edge is bidirectional
+    G_simplified = nx.Graph()
     G_simplified.add_nodes_from(G_undirected.nodes(data=True))
     for u, v, data in G_undirected.edges(data=True):
         G_simplified.add_edge(u, v, **data)
@@ -119,11 +120,11 @@ def calculate_absorber_score(n, G):
 
 
 def importance_removal(
-    G:nx.DiGraph,
-    importance_scores:dict,
-    keep_nodes:list=None,
-    removal_fraction:float=0.1,
-) -> nx.DiGraph:
+    G: nx.Graph,
+    importance_scores: dict[str, float],
+    keep_nodes: list[str] = None,
+    removal_fraction: float = 0.1,
+) -> nx.Graph:
     """
     Simplifies a graph using Node Absorption. Low-importance nodes are removed,
     and their connections are re-routed to their most important neighbor.
@@ -131,69 +132,53 @@ def importance_removal(
     if not (0 < removal_fraction < 1):
         raise ValueError("removal_fraction must be between 0 and 1.")
 
+    # We work on a copy
     G_simplified = G.copy()
+    initial_node_count = G_simplified.number_of_nodes()
     
-    # Rank nodes by importance (lowest score first)
-    ranked_nodes = sorted(
-        (n, importance_scores.get(n, float('inf'))) for n in G_simplified.nodes()
-    )
+    # Determine how many nodes to remove
+    num_to_remove = math.ceil(initial_node_count * removal_fraction)
 
-    # Identify the set of nodes to remove
-    num_to_remove = int(len(ranked_nodes) * removal_fraction)
-    nodes_to_remove = {node for node, score in ranked_nodes[:num_to_remove]}
+    for i in range(int(num_to_remove)):
+        # Get the list of nodes that are allowed to be removed
+        removable_nodes = [
+            n for n in G_simplified.nodes() 
+            if not (keep_nodes and n in keep_nodes)
+        ]
+        
+        if not removable_nodes:
+            print("Stopping early: no more removable nodes.")
+            break
 
-    # For each node to be removed plan the re-wiring of its connections
-    new_edges_to_add = []
-    for node in nodes_to_remove:
-        # Ensure the node still exists in the graph
-        if not G_simplified.has_node(node):
-            continue
+        # Find the node with the lowest importance score to remove
+        node_to_remove = min(removable_nodes, key=lambda n: importance_scores.get(n, 0))
 
-        predecessors = list(G_simplified.predecessors(node))
-        successors = list(G_simplified.successors(node))
-        neighbors = set(predecessors) | set(successors)
+        # Find its neighbors in the current graph
+        neighbors = list(G_simplified.neighbors(node_to_remove))
         
         if not neighbors:
+            G_simplified.remove_node(node_to_remove)
             continue
             
-        # Choose the neighbor with the highest absorber score as the absorber
-        valid_neighbors = [n for n in neighbors if n not in nodes_to_remove]
-        if not valid_neighbors:
-            continue
+        # Find the most important neighbor to merge into
+        absorber_node = max(neighbors, key=lambda n: importance_scores.get(n, 0))
         
-        absorber_node = max(valid_neighbors, key=lambda n: calculate_absorber_score(n, G_simplified))
-        
-        # Re-wire predecessors to the absorber_node
-        for p in predecessors:
-            if p != absorber_node:
-                # Copy the original edge data for the new re-wired edge
-                edge_data = G_simplified.edges[p, node]
-                new_edges_to_add.append((p, absorber_node, edge_data))
-                
-        # Re-wire successors to the absorber_node
-        for s in successors:
-            if s != absorber_node:
-                # Copy the original edge data for the new re-wired edge
-                edge_data = G_simplified.edges[node, s]
-                new_edges_to_add.append((absorber_node, s, edge_data))
-
-    # Perform all graph modifications at the end
-    G_simplified.add_edges_from(new_edges_to_add)
-    G_simplified.remove_nodes_from(nodes_to_remove)
-    G_simplified = reconnect_nodes(
-        G,
-        G_simplified,
-        filter_nodes(G, keep_nodes)
-    )
+        G_simplified = nx.contracted_nodes(G_simplified, absorber_node, node_to_remove, self_loops=False)
+    
+    # Post-processing
     G_simplified = find_largest_subgraph(G_simplified)
     add_norm_capacity(G_simplified)
+    
+    final_node_count = G_simplified.number_of_nodes()
+    print(f"Successfully removed {initial_node_count - final_node_count} nodes.")
+    
     return G_simplified
 
 def k_core(
-        G:nx.DiGraph, 
+        G:nx.Graph, 
         keep_nodes:list=None,
         k:int=4,
-    ) -> nx.DiGraph:
+    ) -> nx.Graph:
     G_simplified = nx_algorithms.core.k_core(G, k)
     G_simplified = reconnect_nodes(
         G,
@@ -204,7 +189,7 @@ def k_core(
     return G_simplified
 
 def gnn_clustering(
-        G:nx.DiGraph, 
+        G:nx.Graph, 
         keep_nodes:list=None,
         n_clusters:int=None, 
         coord_weight:float=None
@@ -255,7 +240,7 @@ def find_optimal_geo_clusters(scaled_coords:np.ndarray, k_range: range = range(2
     return best_k
 
 def k_means(
-        G:nx.DiGraph, 
+        G:nx.Graph, 
         keep_nodes:list=None, 
         n_clusters:int=None
     ) -> list[frozenset]:
@@ -297,7 +282,7 @@ def k_means(
     return communities, G_simplified
 
 # Capacity?, norm_capacity
-def maximum_spanning_arborescence(G:nx.DiGraph, keep_nodes:list=None, attr:str='capacity') -> nx.DiGraph:
+def maximum_spanning_arborescence(G:nx.Graph, keep_nodes:list=None, attr:str='capacity') -> nx.Graph:
     arborescence = nx.maximum_spanning_arborescence(G, attr=attr)
 
     # Explicitly copy node data from the original graph to the new one
@@ -306,14 +291,14 @@ def maximum_spanning_arborescence(G:nx.DiGraph, keep_nodes:list=None, attr:str='
     
     return arborescence
 
-def greedy_modularity_communities(G:nx.DiGraph, keep_nodes:list=None) -> list[frozenset]:
+def greedy_modularity_communities(G:nx.Graph, keep_nodes:list=None) -> list[frozenset]:
     communities = nx.algorithms.community.greedy_modularity_communities(G, weight='capacity')
     G_simplified = build_clustered_graph(G, communities)
     print("Gefundene Communities: " + str(len(communities)))
     print(f"Modularität Q = {modularity(G, communities)}")
     return communities, G_simplified
 
-def louvain_communities(G:nx.DiGraph, keep_nodes:list=None, seed:int=42) -> list[frozenset]:
+def louvain_communities(G:nx.Graph, keep_nodes:list=None, seed:int=42) -> list[frozenset]:
     communities = nx.algorithms.community.louvain_communities(G, weight='capacity', seed=seed)
     G_simplified = build_clustered_graph(G, communities)
     print("Gefundene Communities: " + str(len(communities)))
