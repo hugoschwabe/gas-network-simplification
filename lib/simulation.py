@@ -154,7 +154,7 @@ def calculate_max_deliverability(
     flow_value, _ = nx.maximum_flow(G_flow, sources, sinks, capacity=capacity, flow_func=flow_func)
     return flow_value
 
-def calculate_deliverability_error(G_original: nx.Graph, G_simplified: nx.Graph) -> float:
+def calculate_deliverability_error(G_original: nx.Graph, G_simplified: nx.Graph, verbose:bool=False) -> float:
     """
     Calculates the physical error score between an original and a simplified networkx graph.
     """
@@ -172,11 +172,12 @@ def calculate_deliverability_error(G_original: nx.Graph, G_simplified: nx.Graph)
         capacity="capacity",
         flow_func=edmonds_karp
     )
-
-    print(f"Original Deliverability: {f_orig} kg/s")
-    print(f"Simplified Deliverability: {f_simp} kg/s")
+    if verbose:
+        print(f"Original Deliverability: {f_orig} kg/s")
+        print(f"Simplified Deliverability: {f_simp} kg/s")
 
     if f_orig == 0:
+        print("f_orig is zero. Error cannot be calculated.")
         return 0.0 if f_simp == 0 else float('inf')
 
     error = abs(f_orig - f_simp) / f_orig

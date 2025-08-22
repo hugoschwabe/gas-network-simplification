@@ -1,34 +1,55 @@
 from collections import defaultdict
+import inspect
 import geopandas as gpd
 from matplotlib import pyplot as plt
 import pandas as pd
 import networkx as nx
-from networkx.algorithms.community.quality import modularity
 import copy
 from pyvis.network import Network
 import numpy as np
+from matplotlib.lines import Line2D
 import json
 
-def _sanitize_value_for_gml(value):
+def nuts3(path:str="./data//NUTS3/NUTS_RG_20M_2024_4326.shp"):
+    nuts3 = gpd.read_file(path).set_index("NUTS_ID")
+    nuts3 = nuts3[nuts3["LEVL_CODE"] == 3]
+    nuts3 = nuts3.to_crs("EPSG:4326")
+    nuts3 = nuts3.reset_index()
+    return nuts3
+
+def importance_weights(path:str="data/detailed_property_weights.csv"):
+    importance = pd.read_csv(path)
+    importance = importance.set_index("node_name")
+    importance["impact_pct"] = importance["impact_pct"] / importance["impact_pct"].max()
+    importance = importance["impact_pct"].sort_values().to_dict()
+    return importance
+
+def _sanitize_for_gml(data):
     """
     Sanitizes an attribute value for GML compatibility.
     """
-    # If the value is not a dictionary it does not need to be changed.
-    if not isinstance(value, dict):
-        return value
-
-    # Check if the values within this dictionary are also dictionaries.
-    if value and isinstance(next(iter(value.values())), dict):
-        restructured_list = []
-        for node_key, data_dict in value.items():
-            # Create a new dictionary for this entry
-            new_entry = {'node_name': str(node_key)}
-            # Merge the original data into it
-            new_entry.update(data_dict)
-            restructured_list.append(new_entry)
-        return restructured_list
-
-    return value
+    if isinstance(data, dict):
+        # Heuristic: Check if the values are also dictionaries (the problematic structure)
+        if data and isinstance(next(iter(data.values())), dict):
+            # This is the dict-of-dicts we need to restructure
+            restructured_list = []
+            for key, value_dict in data.items():
+                new_entry = {'original_name': str(key)} # The invalid key becomes a value
+                # Make sure the inner dictionary is also sanitized
+                new_entry.update(_sanitize_for_gml(value_dict))
+                restructured_list.append(new_entry)
+            return restructured_list
+        else:
+            # This is a normal dictionary, just sanitize its values
+            return {key: _sanitize_for_gml(value) for key, value in data.items()}
+    
+    # If it's a list, we need to sanitize each of its items
+    elif isinstance(data, list):
+        return [_sanitize_for_gml(item) for item in data]
+    
+    # Otherwise (string, number, etc.), it's safe
+    else:
+        return data
 
 
 def write_gml(G: nx.Graph, path: str) -> None:
@@ -41,14 +62,14 @@ def write_gml(G: nx.Graph, path: str) -> None:
     for node, data in G_copy.nodes(data=True):
         data.pop("supply", None)
         for attr_key, attr_value in data.items():
-            data[attr_key] = _sanitize_value_for_gml(attr_value)
+            data[attr_key] = _sanitize_for_gml(attr_value)
 
     # Sanitize edge attributes
     for u, v, data in G_copy.edges(data=True):
         data.pop("capacity", None)
         data.pop("norm_capacity", None)
         for attr_key, attr_value in data.items():
-            data[attr_key] = _sanitize_value_for_gml(attr_value)
+            data[attr_key] = _sanitize_for_gml(attr_value)
 
     # Write to GML
     nx.write_gml(G_copy, path)
@@ -108,98 +129,104 @@ def graph_to_edges_df(G:nx.Graph) -> pd.DataFrame:
 
 def build_clustered_graph(
     G:nx.Graph,
-    results: list[frozenset]
+    communities: list[frozenset],
+    keep_nodes:list[str]
 ) -> nx.Graph:
     """
     Builds a robust simplified nx.Graph from community detection results.
     """
-    # Map each original node to its new group (cluster) ID
-    node_to_group_map = {node: i for i, community in enumerate(results) for node in community}
-
-    # Aggregate node properties for each group
-    nodes_df = pd.DataFrame.from_dict(dict(G.nodes(data=True)), orient='index')
-    nodes_df['node_id'] = nodes_df.index
-    nodes_df['group'] = nodes_df['node_id'].map(node_to_group_map)
-    
-    # Handle missing coordinate data
-    nodes_df['x'] = nodes_df.get("coord", pd.Series(dtype=object)).map(lambda x: x[0] if isinstance(x, (list, tuple)) else None)
-    nodes_df['y'] = nodes_df.get("coord", pd.Series(dtype=object)).map(lambda x: x[1] if isinstance(x, (list, tuple)) else None)
-
-    simplified_nodes_agg = nodes_df.groupby("group").agg(
-        x=('x', 'mean'),
-        y=('y', 'mean'),
-        original_nodes=('node_id', list),
-        original_node_data=('node_id', lambda ids: {nid: G.nodes[nid] for nid in ids})
-    )
-
-    # Aggregate edge properties for connections between clusters
-    inter_cluster_edges = defaultdict(list)
-    for u, v, data in G.edges(data=True):
-        group_u = node_to_group_map.get(u)
-        group_v = node_to_group_map.get(v)
-
-        if group_u is not None and group_v is not None and group_u != group_v:
-            edge_tuple = (group_u, group_v)
-            inter_cluster_edges[edge_tuple].append(data)
-
-    # Create a single new edge for each directed connection between clusters
-    simplified_edges = []
-    for (group_u, group_v), edges_data_list in inter_cluster_edges.items():
-        total_capacity = sum(d.get('capacity', 0) for d in edges_data_list)
-        if total_capacity < 0: continue
-
-        # Use capacity-weighted average for length
-        avg_len = sum(d.get('L', 0) * d.get('capacity', 0) for d in edges_data_list) / total_capacity
-        
-        # Calculate the physically equivalent diameter
-        sum_of_dn_powered = sum(d.get('DN', 0) ** 2.5 for d in edges_data_list)
-        equivalent_dn = sum_of_dn_powered ** (1/2.5)
-        avg_pmax = sum(d.get('Pmax', 0) * d.get('capacity', 0) for d in edges_data_list) / total_capacity
-
-        new_edge_data = {
-            'capacity': total_capacity,
-            'L': avg_len,
-            'DN': equivalent_dn,
-            'Pmax': avg_pmax,
-            'edge_type': 'aggregated_pipe_equivalent'
-        }
-        simplified_edges.append((group_u, group_v, new_edge_data))
-
-    # Build the final simplified graph
     simplified_graph = nx.Graph()
-    for group_id, data in simplified_nodes_agg.iterrows():
+    
+    # Map each non-critical node to its new cluster ID
+    node_to_cluster_map = {
+        node: f"C_{i}" for i, community in enumerate(communities) for node in community
+    }
+
+    # Create the cluster nodes ("super-nodes")
+    for i, community in enumerate(communities):
+        cluster_name = f"C_{i}"
+        # Aggregate properties for the nodes within this cluster
+        community_nodes_data = {node: G.nodes[node] for node in community}
+        coords = [d.get('coord', (None, None)) for d in community_nodes_data.values()]
+        valid_coords = [c for c in coords if c[0] is not None]
+        
+        # Calculate mean coordinates for the cluster
+        avg_x = sum(c[0] for c in valid_coords) / len(valid_coords) if valid_coords else None
+        avg_y = sum(c[1] for c in valid_coords) / len(valid_coords) if valid_coords else None
+        
         simplified_graph.add_node(
-            f"C_{group_id}",
-            coord=(data['x'], data['y']),
-            x=data['x'],
-            y=data['y'],
-            original_nodes=data['original_nodes'],
-            original_node_data=data['original_node_data']
+            cluster_name,
+            coord=(avg_x, avg_y),
+            original_nodes=list(community),
+            supply=sum(d.get('supply', 0) for d in community_nodes_data.values())
         )
     
-    simplified_graph.add_edges_from(
-        (f"C_{u}", f"C_{v}", data) for u, v, data in simplified_edges
-    )
+    # Add the protected critical nodes back into the graph
+    critical_nodes = {
+        node for node in G.nodes() 
+        if any(str(node).lower().startswith(p.lower()) for p in keep_nodes)
+    }
+    for node in critical_nodes:
+        simplified_graph.add_node(node, **G.nodes[node])
 
-    for _, simp_data in simplified_graph.nodes(data=True):
-        total_cluster_supply = 0
-        # Look inside the cluster to find the original nodes it contains
-        for orig_node_id in simp_data['original_nodes']:
-            # Get the supply value from the original graph's node
-            total_cluster_supply += G.nodes[orig_node_id].get('supply', 0)
+    # Create edges between clusters and connect critical nodes
+    edges_to_aggregate = defaultdict(list)
+    
+    for u, v, data in G.edges(data=True):
+        u_is_crit = u in critical_nodes
+        v_is_crit = v in critical_nodes
         
-        # Assign the summed value as the supply attribute for the cluster node
-        simp_data['supply'] = total_cluster_supply
+        # Determine the endpoint names in the new graph
+        u_new = u if u_is_crit else node_to_cluster_map.get(u)
+        v_new = v if v_is_crit else node_to_cluster_map.get(v)
 
-    add_norm_capacity(simplified_graph)
+        if u_new is None or v_new is None or u_new == v_new:
+            continue
+            
+        # Group edges between the same two new nodes for aggregation
+        edge_tuple = tuple(sorted((u_new, v_new)))
+        edges_to_aggregate[edge_tuple].append(data)
+
+    # Aggregate the edge properties and add to the graph
+    for (u_new, v_new), edge_data_list in edges_to_aggregate.items():
+        total_capacity = sum(d.get('capacity', 0) for d in edge_data_list)
+        if total_capacity <= 0: continue
+            
+        avg_len = sum(d.get('L', 0) * d.get('capacity', 0) for d in edge_data_list) / total_capacity
+        sum_dn_powered = sum(d.get('DN', 0) ** 2.5 for d in edge_data_list)
+        equiv_dn = (sum_dn_powered ** (1/2.5)) if sum_dn_powered > 0 else 0
+        avg_pmax = sum(d.get('Pmax', 0) * d.get('capacity', 0) for d in edge_data_list) / total_capacity
+
+        simplified_graph.add_edge(
+            u_new, v_new,
+            capacity=total_capacity, L=avg_len, DN=equiv_dn, Pmax=avg_pmax,
+            edge_type='aggregated_pipe'
+        )
     return simplified_graph
 
+def run_algo(func, original:nx.Graph, **kwargs) -> nx.Graph:
+    """
+    Run a NetworkX algorithm and return the results.
+    """
+    try:
+        sig = inspect.signature(func)
+        valid_arg_names = {p.name for p in sig.parameters.values()}
+
+        filtered_kwargs = {
+            key: value for key, value in kwargs.items() 
+            if key in valid_arg_names
+        }
+
+        _, graph = func(G=original, **filtered_kwargs)
+        return graph
+    except Exception as e:
+        print(e)
+        return
 
 def plot_network(
         G:nx.Graph, 
         gdf:gpd.GeoDataFrame=None, 
         clusters:list=None, 
-        node_size:int=20, 
         title:str="Title", 
         padding_ratio:float=0.15, 
         nodes:bool=True, 
@@ -232,19 +259,21 @@ def plot_network(
         if not str(node).lower().startswith(('cs', 'cv'))
     ]
 
-    # 2. Draw the edges and labels for all nodes
-    nx.draw_networkx_edges(G, pos, ax=ax, arrows=False, edge_color='gray')
+    # Draw the edges and labels for all nodes
+    edge_capacities = [G[u][v]['capacity'] for u, v in G.edges()]
+    edge_capacities = [1+(x/200) if 1+(x/200)<5 else 5 for x in edge_capacities]
+    nx.draw_networkx_edges(G, pos, ax=ax, arrows=False, edge_color='gray', width=edge_capacities)
     #nx.draw_networkx_labels(G, pos, ax=ax)
 
-    # 3. Draw each category of nodes with a different color
+    # Draw each category of nodes with a different color
     nx.draw_networkx_nodes(
-        G, pos, nodelist=other_nodes, node_color='black', node_size=10, ax=ax, label='Junctions/Other'
+        G, pos, nodelist=other_nodes, node_color='black', node_size=2*max(edge_capacities), ax=ax, label='Junctions/Other'
     )
     nx.draw_networkx_nodes(
-        G, pos, nodelist=cs_nodes, node_color='red', node_size=30, ax=ax, label='Compressor Stations'
+        G, pos, nodelist=cs_nodes, node_color='red', node_size=6*max(edge_capacities), ax=ax, label='Compressor Stations'
     )
     nx.draw_networkx_nodes(
-        G, pos, nodelist=cv_nodes, node_color='blue', node_size=30, ax=ax, label='Control Valves'
+        G, pos, nodelist=cv_nodes, node_color='blue', node_size=6*max(edge_capacities), ax=ax, label='Control Valves'
     )
 
     
@@ -261,6 +290,121 @@ def plot_network(
     ax.set
     plt.tight_layout()
     plt.show()
+
+def plot_networks_side_by_side(
+    original_graph: nx.Graph,
+    simplified_graph: nx.Graph,
+    gdf: gpd.GeoDataFrame = None,
+    original_title: str = "Original Network",
+    simplified_title: str = "Simplified Network",
+    padding_ratio: float = 0.15
+) -> None:
+    """
+    Plots two NetworkX graphs side-by-side with a single shared legend.
+    
+    Args:
+        original_graph: The original NetworkX graph.
+        simplified_graph: The simplified NetworkX graph.
+        gdf: Optional GeoDataFrame for plotting a background map.
+        original_title: The title for the original graph's subplot.
+        simplified_title: The title for the simplified graph's subplot.
+        padding_ratio: The ratio of padding to add around the network plots.
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(24, 16))
+
+    graphs = {
+        original_title: original_graph,
+        simplified_title: simplified_graph
+    }
+
+    # Determine common bounds for both plots for consistent scale and position
+    x_vals_all, y_vals_all = [], []
+    for g in graphs.values():
+        try:
+            pos = {node: (data["coord"][0], data["coord"][1]) for node, data in g.nodes(data=True)}
+        except KeyError:
+            pos = {node: (data["x"], data["y"]) for node, data in g.nodes(data=True)}
+        
+        if pos:
+            x_vals_all.extend([coord[0] for coord in pos.values()])
+            y_vals_all.extend([coord[1] for coord in pos.values()])
+
+    if not x_vals_all or not y_vals_all:
+        print("Cannot plot graphs with no node coordinates.")
+        return
+        
+    x_min, x_max = min(x_vals_all), max(x_vals_all)
+    y_min, y_max = min(y_vals_all), max(y_vals_all)
+    x_pad = (x_max - x_min) * padding_ratio
+    y_pad = (y_max - y_min) * padding_ratio
+    xlims = (x_min - x_pad, x_max + x_pad)
+    ylims = (y_min - y_pad, y_max + y_pad)
+
+    # Plot each graph on its respective subplot
+    for ax, (title, G) in zip(axes, graphs.items()):
+        if gdf is not None:
+            gdf.plot(ax=ax, color='lightgrey', edgecolor='white', alpha=0.5, linewidth=2, zorder=0)
+
+        try:
+            pos = {node: (data["coord"][0], data["coord"][1]) for node, data in G.nodes(data=True)}
+        except KeyError:
+            pos = {node: (data["x"], data["y"]) for node, data in G.nodes(data=True)}
+        
+        if not pos:
+            ax.set_title(f"{title}", fontdict={'fontsize': 16})
+            continue
+
+        # Categorize nodes
+        cs_nodes = [node for node in G.nodes() if str(node).lower().startswith('cs')]
+        cv_nodes = [node for node in G.nodes() if str(node).lower().startswith('cv')]
+        other_nodes = [
+            node for node in G.nodes()
+            if not str(node).lower().startswith(('cs', 'cv'))
+        ]
+        
+        # Draw edges
+        edge_widths = [1]
+        if G.edges():
+            edge_capacities = [G[u][v].get('capacity', 1) for u, v in G.edges()]
+            edge_widths = [1 + (x / 200) if 1 + (x / 200) < 5 else 5 for x in edge_capacities]
+            nx.draw_networkx_edges(G, pos, ax=ax, arrows=False, edge_color='gray', width=edge_widths)
+        
+        # Draw nodes
+        node_size_base = 1.5*max(edge_widths)
+        nx.draw_networkx_nodes(
+            G, pos, nodelist=other_nodes, node_color='black', node_size=node_size_base, ax=ax
+        )
+        nx.draw_networkx_nodes(
+            G, pos, nodelist=cs_nodes, node_color='red', node_size=3 * node_size_base, ax=ax
+        )
+        nx.draw_networkx_nodes(
+            G, pos, nodelist=cv_nodes, node_color='blue', node_size=3 * node_size_base, ax=ax
+        )
+
+        ax.set_xlim(xlims)
+        ax.set_ylim(ylims)
+        ax.set_title(title, fontdict={'fontsize': 20})
+        ax.set_axis_on()
+        # Remove the x and y tick labels
+        ax.tick_params(axis='both', which='both', bottom=False, top=False, left=False, right=False,
+                         labelbottom=False, labelleft=False)
+
+    # Create a single, shared legend for the entire figure
+    legend_elements = [
+        Line2D([0], [0], marker='o', color='w', label='Compressor Station', markerfacecolor='red', markersize=15),
+        Line2D([0], [0], marker='o', color='w', label='Control Valve', markerfacecolor='blue', markersize=15),
+        Line2D([0], [0], marker='o', color='w', label='Other Junction', markerfacecolor='black', markersize=10)
+    ]
+    # Place legend at the bottom center of the figure
+    fig.legend(handles=legend_elements, loc='lower center', ncol=3, fontsize='x-large', frameon=False)
+    
+    # Add text explaining edge width below the legend
+    fig.text(0.5, 0.05, 'Edge width is proportional to pipeline capacity', ha='center', va='center', fontsize=14)
+
+    # Adjust layout to make space for legend and text
+    fig.subplots_adjust(bottom=0.001)
+    plt.show()
+
 
 def plot_network_pyvis(
     G: nx.Graph, 
@@ -492,7 +636,7 @@ def estimate_gas_flow(
     - dn_mm: nominal diameter (mm)
     - length_km: pipeline length (km)
     - G: specific gravity (default 0.6 for natural gas)
-    - T: temperature in Kelvin (default 288 K)
+    - T_k: temperature in Kelvin (default 288.15 K)
     - k_p: pressure coefficient (default drop of 0.2 bar/km)
     
     Returns:

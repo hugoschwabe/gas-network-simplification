@@ -1,7 +1,5 @@
 import networkx as nx
-from itertools import product
 import networkx.algorithms as nx_algorithms
-from networkx.algorithms.community.quality import modularity
 import numpy as np
 import math
 
@@ -16,7 +14,7 @@ from lib.utils import estimate_gas_flow, add_norm_capacity, build_clustered_grap
 def path_contraction(
         G:nx.Graph,
         keep_nodes:list=None
-    ) -> nx.Graph:
+    ) -> tuple[list[frozenset], nx.Graph]:
     """
     Correctly performs path contraction on a Graph with bidirectional edges.
     """
@@ -107,24 +105,14 @@ def path_contraction(
         filter_nodes(G, keep_nodes)
     )
     add_norm_capacity(G_simplified)
-    return G_simplified
-
-def calculate_absorber_score(n, G):
-    w_capacity = 0.8
-    w_degree = 0.2
-    
-    # Sum the capacity of all pipes connected to the neighbor n
-    total_neighbor_capacity = sum(d.get('capacity', 0) for _, _, d in G.edges(n, data=True))
-    
-    return (w_capacity * total_neighbor_capacity) + (w_degree * G.degree(n))
-
+    return [], G_simplified
 
 def importance_removal(
     G: nx.Graph,
-    importance_scores: dict[str, float],
+    importance_weights: dict[str, float],
     keep_nodes: list[str] = None,
-    removal_fraction: float = 0.1,
-) -> nx.Graph:
+    removal_fraction: float = 0.5,
+) -> tuple[list[frozenset], nx.Graph]:
     """
     Simplifies a graph using Node Absorption. Low-importance nodes are removed,
     and their connections are re-routed to their most important neighbor.
@@ -151,7 +139,7 @@ def importance_removal(
             break
 
         # Find the node with the lowest importance score to remove
-        node_to_remove = min(removable_nodes, key=lambda n: importance_scores.get(n, 0))
+        node_to_remove = min(removable_nodes, key=lambda n: importance_weights.get(n, 0))
 
         # Find its neighbors in the current graph
         neighbors = list(G_simplified.neighbors(node_to_remove))
@@ -161,24 +149,29 @@ def importance_removal(
             continue
             
         # Find the most important neighbor to merge into
-        absorber_node = max(neighbors, key=lambda n: importance_scores.get(n, 0))
+        absorber_node = max(neighbors, key=lambda n: importance_weights.get(n, 0))
         
         G_simplified = nx.contracted_nodes(G_simplified, absorber_node, node_to_remove, self_loops=False)
     
     # Post-processing
     G_simplified = find_largest_subgraph(G_simplified)
+    G_simplified = reconnect_nodes(
+        G,
+        G_simplified,
+        filter_nodes(G, keep_nodes)
+    )
     add_norm_capacity(G_simplified)
     
     final_node_count = G_simplified.number_of_nodes()
     print(f"Successfully removed {initial_node_count - final_node_count} nodes.")
     
-    return G_simplified
+    return [], G_simplified
 
 def k_core(
         G:nx.Graph, 
         keep_nodes:list=None,
-        k:int=4,
-    ) -> nx.Graph:
+        k:int=2,
+    ) -> tuple[list[frozenset], nx.Graph]:
     G_simplified = nx_algorithms.core.k_core(G, k)
     G_simplified = reconnect_nodes(
         G,
@@ -186,20 +179,26 @@ def k_core(
         filter_nodes(G, keep_nodes)
     )
     add_norm_capacity(G_simplified)
-    return G_simplified
+    return [], G_simplified
 
 def gnn_clustering(
         G:nx.Graph, 
         keep_nodes:list=None,
         n_clusters:int=None, 
-        coord_weight:float=None
-    ) -> list[frozenset]:
+        coord_weight:float=0.8
+    ) -> tuple[list[frozenset],nx.Graph]:
     """
     Main pipeline function to run the entire GNN-based graph simplification process.
     If n_clusters or coord_weight is None, they will be determined automatically.
     """
+    critical_nodes = {
+        node for node in G.nodes() 
+        if any(str(node).lower().startswith(p.lower()) for p in keep_nodes)
+    }
+    G_clustering = G.subgraph(set(G.nodes()) - critical_nodes).copy()
+
     # Prepare data with a neutral weight initially for the GNN training
-    pyg_data, node_names_map, scaled_coords = gnn.prepare_data(G, coord_weight=1.0)
+    pyg_data, node_names_map, scaled_coords = gnn.prepare_data(G_clustering, coord_weight=coord_weight)
     trained_model = gnn.train_gnn_model(pyg_data)
 
     # If hyperparameters are not provided, find the optimal values
@@ -208,11 +207,14 @@ def gnn_clustering(
 
     # Generate the final communities and graph using the determined hyperparameters
     communities = gnn.get_gnn_communities(trained_model, pyg_data, node_names_map, n_clusters, scaled_coords, coord_weight)
-    graph = build_clustered_graph(G, communities)
+    graph = build_clustered_graph(G, communities, keep_nodes)
     
     return communities, graph
 
-def find_optimal_geo_clusters(scaled_coords:np.ndarray, k_range: range = range(20, 251, 10)) -> int:
+def find_optimal_geo_clusters(
+        scaled_coords:np.ndarray, 
+        k_range:range=range(20, 251, 10)
+    ) -> int:
     best_score = -1
     best_k = -1
 
@@ -243,15 +245,21 @@ def k_means(
         G:nx.Graph, 
         keep_nodes:list=None, 
         n_clusters:int=None
-    ) -> list[frozenset]:
+    ) -> tuple[list[frozenset],nx.Graph]:
     # Extract node coordinates
     if not G.nodes:
         print("Graph has no nodes. Returning empty list.")
         return []
 
+    critical_nodes = {
+        node for node in G.nodes() 
+        if any(str(node).lower().startswith(p.lower()) for p in keep_nodes)
+    }
+    G_clustering = G.subgraph(set(G.nodes()) - critical_nodes).copy()
+
     try:
-        node_list = list(G.nodes())
-        coords = np.array([G.nodes[node]['coord'] for node in node_list])
+        node_list = list(G_clustering.nodes())
+        coords = np.array([G_clustering.nodes[node]['coord'] for node in node_list])
     except KeyError:
         print("Error: Nodes in the graph are missing the 'coord' attribute.")
         return []
@@ -278,29 +286,26 @@ def k_means(
     
     print(f"Geographic Clustering Finished. Found {len(communities)} communities\n")
 
-    G_simplified = build_clustered_graph(G, communities)
+    G_simplified = build_clustered_graph(G, communities, keep_nodes)
     return communities, G_simplified
 
-# Capacity?, norm_capacity
-def maximum_spanning_arborescence(G:nx.Graph, keep_nodes:list=None, attr:str='capacity') -> nx.Graph:
-    arborescence = nx.maximum_spanning_arborescence(G, attr=attr)
-
-    # Explicitly copy node data from the original graph to the new one
-    for node, data in G.nodes(data=True):
-        arborescence.add_node(node, **data)
+def greedy_modularity_communities(G:nx.Graph, keep_nodes:list=None) -> tuple[list[frozenset],nx.Graph]:
+    critical_nodes = {
+        node for node in G.nodes() 
+        if any(str(node).lower().startswith(p.lower()) for p in keep_nodes)
+    }
+    G_clustering = G.subgraph(set(G.nodes()) - critical_nodes).copy()
     
-    return arborescence
-
-def greedy_modularity_communities(G:nx.Graph, keep_nodes:list=None) -> list[frozenset]:
-    communities = nx.algorithms.community.greedy_modularity_communities(G, weight='capacity')
-    G_simplified = build_clustered_graph(G, communities)
-    print("Gefundene Communities: " + str(len(communities)))
-    print(f"Modularität Q = {modularity(G, communities)}")
+    communities = nx.algorithms.community.greedy_modularity_communities(G_clustering, weight='capacity')
+    G_simplified = build_clustered_graph(G, communities, keep_nodes)
     return communities, G_simplified
 
-def louvain_communities(G:nx.Graph, keep_nodes:list=None, seed:int=42) -> list[frozenset]:
-    communities = nx.algorithms.community.louvain_communities(G, weight='capacity', seed=seed)
-    G_simplified = build_clustered_graph(G, communities)
-    print("Gefundene Communities: " + str(len(communities)))
-    print(f"Modularität Q = {modularity(G, communities)}")
+def louvain_communities(G:nx.Graph, keep_nodes:list=None, seed:int=42) -> tuple[list[frozenset],nx.Graph]:
+    critical_nodes = {
+        node for node in G.nodes() 
+        if any(str(node).lower().startswith(p.lower()) for p in keep_nodes)
+    }
+    G_clustering = G.subgraph(set(G.nodes()) - critical_nodes).copy()
+    communities = nx.algorithms.community.louvain_communities(G_clustering, weight='capacity', seed=seed)
+    G_simplified = build_clustered_graph(G, communities, keep_nodes)
     return communities, G_simplified

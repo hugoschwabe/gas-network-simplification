@@ -1,11 +1,8 @@
 import networkx as nx
-from networkx.algorithms.flow import edmonds_karp
 import pandas as pd
 from tqdm import tqdm
-import geopandas as gpd
 
-from lib.utils import estimate_gas_flow, graph_to_nodes_df
-from lib.simulation import calculate_max_deliverability, prepare_graph_for_max_flow
+from lib.simulation import prepare_graph_for_max_flow
 
 def calculate_node_type_importance(graph: nx.Graph) -> pd.DataFrame:
     """

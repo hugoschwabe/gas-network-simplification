@@ -1,6 +1,7 @@
 import geopandas as gpd
 import networkx as nx
 import numpy as np
+import pandas as pd
 from scipy.stats import wasserstein_distance
 from scipy.spatial.distance import jensenshannon
 
@@ -11,7 +12,7 @@ def complexity(
         original:nx.Graph, 
         simplified:nx.Graph, 
         verbose:bool=False
-    ) -> float:
+    ) -> tuple[float, dict]:
     """
     Calculate and return the complexity part of the scoring function
     """
@@ -38,9 +39,18 @@ def complexity(
         print(f"post_cyclo: {post_cyclo}")
         print(f"cyclomatic_score: {cyclo_score}")
         print(f"complexity_score: {complexity_score}\n")
+    
+    dict = {
+        "nodes_score": nodes_score,
+        "edges_score": edges_score,
+        "pre_cyclo": pre_cyclo,
+        "post_cyclo": post_cyclo,
+        "cyclomatic_score": cyclo_score,
+        "complexity_score": complexity_score
+    }
 
     # Average the three complexity scores and return result
-    return complexity_score
+    return complexity_score, dict
 
 def get_portrait(
         graph: nx.Graph, 
@@ -107,7 +117,7 @@ def structure(
         original:nx.Graph, 
         simplified:nx.Graph, 
         verbose:bool=False
-    ) -> float:
+    ) -> tuple[float, dict]:
     """
     Calculate and return the structure part of the scoring function
     """
@@ -246,7 +256,14 @@ def structure(
         print(f"spectral_dist_score: {spectral_score}")
         print(f"structure_score: {structure_score}\n")
 
-    return structure_score
+    dict = {
+        "pdiv_score": pdiv_score,
+        "emd_score": emd_score,
+        "spectral_dist_score": spectral_score,
+        "structure_score": structure_score
+    }
+
+    return structure_score, dict
 
 def count_regions(G:nx.Graph, regions:gpd.GeoDataFrame) -> int:
     df = gpd.GeoDataFrame(utils.graph_to_nodes_df(G))
@@ -261,7 +278,7 @@ def regionality(
         simplified:nx.Graph, 
         regions:gpd.GeoDataFrame, 
         verbose:bool=False
-    ) -> float:
+    ) -> tuple[float, dict]:
     """
     Calculate and return the regionality part of the scoring function
     """
@@ -274,7 +291,12 @@ def regionality(
         print(f"simplified_regions: {simplified_regions}")
         print(f"regionality_score: {regionality_score}\n")
 
-    return regionality_score
+    dict = {
+        "original_regions": original_regions,
+        "simplified_regions": simplified_regions,
+        "regionality_score": regionality_score
+    }
+    return regionality_score, dict
 
 def get_node_role_score(node_name: str, role_weights: dict) -> float:
     """
@@ -305,7 +327,7 @@ def properties(
         simplified: nx.Graph,
         weights: dict,
         verbose: bool = False
-    ) -> float:
+    ) -> tuple[float, dict]:
     """
     Calculates the properties part of the scoring fuction.
     """
@@ -338,8 +360,9 @@ def properties(
 
     # Normalization for both cases
     if original_properties > 0:
-        properties_score = simplified_properties / original_properties
-        properties_score = min(properties_score, 1.0)
+        properties_score = 1 - (abs(original_properties - simplified_properties) / original_properties)
+        if properties_score > 1: properties_score = 1.0
+        elif properties_score < 0: properties_score = 0.0
     else:
         properties_score = 0
     
@@ -347,11 +370,21 @@ def properties(
         print(f"original_properties: {original_properties}")
         print(f"simplified_properties: {simplified_properties}")
         print(f"properties_score: {properties_score}\n")
+
+    dict = {
+        "original_properties": original_properties,
+        "simplified_properties": simplified_properties,
+        "properties_score": properties_score
+    }
     
-    return properties_score
+    return properties_score, dict
 
 
-def flow(original: nx.Graph, simplified: nx.Graph, verbose: bool = False) -> float:
+def flow(
+        original: nx.Graph, 
+        simplified: nx.Graph, 
+        verbose: bool = False
+    ) -> tuple[float, dict]:
     """
     Calculates the flow part of the scoring function.
     """
@@ -362,7 +395,12 @@ def flow(original: nx.Graph, simplified: nx.Graph, verbose: bool = False) -> flo
         print(f"max_dev_error: {max_dev_error}")
         print(f"flow_score: {flow_score}\n")
 
-    return flow_score
+    dict = {
+        "max_dev_error": max_dev_error,
+        "flow_score": flow_score
+    }
+
+    return flow_score, dict
 
 def score(
     original: nx.Graph,
@@ -371,7 +409,7 @@ def score(
     weights: dict = {},
     property_weights: dict = {},
     verbose: bool = False
-) -> float:
+) -> tuple[float, dict]:
     """
     Scoring function assessing the quality of the gas network simplification using a weighted sum of different criteria.
     """
@@ -388,11 +426,11 @@ def score(
         print(f"Warning: Weights do not sum to 1.0 (Sum = {total_weight})")
         return
     
-    score_complexity = complexity(original, simplified, verbose)
-    score_structure = structure(original, simplified, verbose)
-    score_regionality = regionality(original, simplified, regions, verbose)
-    score_properties = properties(original, simplified, property_weights, verbose)
-    score_flow = flow(original, simplified, verbose)
+    score_complexity, dict_complexity = complexity(original, simplified, verbose)
+    score_structure, dict_structure = structure(original, simplified, verbose)
+    score_regionality, dict_regionality = regionality(original, simplified, regions, verbose)
+    score_properties, dict_properties = properties(original, simplified, property_weights, verbose)
+    score_flow, dict_flow = flow(original, simplified, verbose)
     
 
     # Calculate the final score as a weighted sum
@@ -403,8 +441,39 @@ def score(
         w_properties * score_properties +
         w_flow * score_flow
     )
+
+    dict = {
+        **dict_complexity,
+        **dict_structure,
+        **dict_regionality,
+        **dict_properties,
+        **dict_flow,
+        "final_score": final_score
+    }
     
     if verbose:
         print(f"Overall Weighted Score: {final_score}")
     
-    return final_score
+    return final_score, dict
+
+def calculate_weighted_score(df: pd.DataFrame, weights: dict[str, float]) -> pd.Series:
+    """
+    Calculates the weighted final score for each algorithm in a DataFrame.
+    """
+    # Ensure the weights sum to 1.0 for a properly normalized score
+    if not abs(sum(weights.values()) - 1.0) < 1e-9:
+        print(f"Warning: Weights do not sum to 1.0 (current sum: {sum(weights.values())}).")
+
+    # Initialize a Series to store the final scores, using the algorithms as the index.
+    weighted_scores = pd.Series(0.0, index=df.columns)
+
+    # Iterate through the weights dictionary
+    for metric, weight in weights.items():
+        if metric in df.index:
+            # Multiply the entire row for that metric by its weight and add it to the total
+            weighted_scores += df.loc[metric] * weight
+        else:
+            # Print a warning if a metric in the weights dict is not in the DataFrame
+            print(f"Warning: Metric '{metric}' from weights dictionary not found in DataFrame index.")
+
+    return weighted_scores
